@@ -1,0 +1,480 @@
+openapi: "3.0.3"
+info:
+  title: chat_service API
+  version: "1.0.0"
+  description: >
+    Persists and serves text channel messages for the Discord-style real-time
+    communication platform: idempotent sends, author-only edits/deletes,
+    cursor-paginated history with reconnect backfill, and Kafka event
+    publication for live delivery. Authorization is delegated synchronously
+    to community_service's internal access endpoint; the session token is a
+    Clerk session JWT verified offline.
+servers:
+  - url: /
+    description: Public API (behind ingress)
+
+tags:
+  - name: messages
+  - name: health
+
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/channels/{channel_id}/messages:
+    get:
+      operationId: listChannelMessages
+      summary: List channel message history (newest-first cursor pagination)
+      description: >
+        Requires the caller to have VIEW_CHANNEL and READ_MESSAGE_HISTORY
+        effective permissions in the channel (checked synchronously against
+        community_service). Returns messages newest-first; `before` paginates
+        backwards, `after` is used by clients to backfill messages missed
+        while disconnected.
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+        - name: before
+          in: query
+          required: false
+          description: Return messages strictly older than this message id.
+          schema:
+            $ref: '#/components/schemas/MessageCursor'
+        - name: after
+          in: query
+          required: false
+          description: Return messages strictly newer than this message id (reconnect backfill).
+          schema:
+            $ref: '#/components/schemas/MessageCursor'
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of messages to return.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Message history page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageListResponse'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          $ref: '#/components/responses/MissingPermission'
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+        "503":
+          $ref: '#/components/responses/AccessServiceUnavailable'
+    post:
+      operationId: sendChannelMessage
+      summary: Send a message (idempotent by client nonce)
+      description: >
+        Requires SEND_MESSAGES and no active timeout (checked synchronously
+        against community_service). Returns `201` for a new message and `200`
+        when the request is a retry with an already-used `client_nonce`, in
+        which case the original message is returned unchanged.
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMessageRequest'
+      responses:
+        "201":
+          description: Message created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        "200":
+          description: Idempotent replay — original message returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is timed out or lacks SEND_MESSAGES in the channel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                member_timed_out:
+                  value:
+                    error:
+                      code: member_timed_out
+                      message: You are timed out in this channel
+                      details:
+                        timed_out_until: "2025-01-01T12:00:00Z"
+                missing_permission:
+                  value:
+                    error:
+                      code: missing_permission
+                      message: You do not have permission to send messages in this channel
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "429":
+          $ref: '#/components/responses/RateLimited'
+        "500":
+          $ref: '#/components/responses/InternalError'
+        "503":
+          $ref: '#/components/responses/AccessServiceUnavailable'
+
+  /v1/channels/{channel_id}/messages/{message_id}:
+    patch:
+      operationId: editChannelMessage
+      summary: Edit own message
+      description: >
+        Author-only. Editing is refused for deleted messages; requests from
+        anyone other than the author are rejected regardless of role.
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+        - $ref: '#/components/parameters/MessageId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EditMessageRequest'
+      responses:
+        "200":
+          description: Message edited
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        "400":
+          $ref: '#/components/responses/BadRequest'
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is not the message author
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                not_message_author:
+                  value:
+                    error:
+                      code: not_message_author
+                      message: Only the author can edit this message
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "422":
+          $ref: '#/components/responses/UnprocessableEntity'
+        "500":
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: deleteChannelMessage
+      summary: Delete own message
+      description: >
+        Author-only; requests from anyone other than the author are rejected.
+        A second delete of the same message returns `404`.
+      tags: [messages]
+      parameters:
+        - $ref: '#/components/parameters/ChannelId'
+        - $ref: '#/components/parameters/MessageId'
+      responses:
+        "204":
+          description: Message deleted
+        "401":
+          $ref: '#/components/responses/Unauthorized'
+        "403":
+          description: Caller is not the message author
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                not_message_author:
+                  value:
+                    error:
+                      code: not_message_author
+                      message: Only the author can delete this message
+        "404":
+          $ref: '#/components/responses/NotFound'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /healthz:
+    get:
+      operationId: getHealthz
+      summary: Liveness probe
+      description: Lightweight liveness check; does not depend on downstream services.
+      tags: [health]
+      security: []
+      responses:
+        "200":
+          description: Process alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        "500":
+          $ref: '#/components/responses/InternalError'
+
+  /readyz:
+    get:
+      operationId: getReadyz
+      summary: Readiness probe
+      description: >
+        Verifies the PostgreSQL connection pool and the Kafka producer are
+        ready before the pod receives traffic; returns `503` once shutdown
+        has started.
+      tags: [health]
+      security: []
+      responses:
+        "200":
+          description: Ready to serve traffic
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        "503":
+          description: Not ready (dependencies unavailable or shutting down)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Clerk session JWT carrying `sub` (platform user id), `username` and `email`.
+
+  parameters:
+    ChannelId:
+      name: channel_id
+      in: path
+      required: true
+      description: Text channel identifier (owned by community_service).
+      schema:
+        type: string
+    MessageId:
+      name: message_id
+      in: path
+      required: true
+      description: Time-ordered message identifier; also used as a pagination cursor.
+      schema:
+        $ref: '#/components/schemas/MessageCursor'
+
+  schemas:
+    MessageCursor:
+      type: string
+      description: Lexicographically sortable, time-ordered message id.
+      example: "01JD8W4FQ9Z2X7K3M5A0B1CDEF"
+
+    SendMessageRequest:
+      type: object
+      required: [content, client_nonce]
+      properties:
+        content:
+          type: string
+          minLength: 1
+          maxLength: 4000
+          description: Plain text message content; attachments are not supported.
+        client_nonce:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Client-generated idempotency key, unique per channel + author.
+          example: "9f1c1f9e-2d0a-4c7b-9b6e-2f1a6d3f8e77"
+
+    EditMessageRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          minLength: 1
+          maxLength: 4000
+
+    Message:
+      type: object
+      required: [message_id, channel_id, community_id, author_user_id, author_username, content, created_at]
+      properties:
+        message_id:
+          $ref: '#/components/schemas/MessageCursor'
+        channel_id:
+          type: string
+        community_id:
+          type: string
+        author_user_id:
+          type: string
+        author_username:
+          type: string
+        content:
+          type: string
+        client_nonce:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        edited_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    MessageListResponse:
+      type: object
+      required: [messages, next_cursor]
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        next_cursor:
+          type: string
+          nullable: true
+          description: >
+            Cursor for the next older page (pass as `before`); null when the
+            beginning of history is reached.
+
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, unavailable]
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable error code (e.g. member_timed_out).
+              example: member_timed_out
+            message:
+              type: string
+              description: Human-readable, non-punitive message.
+            details:
+              description: Optional structured context (e.g. timed_out_until).
+
+  responses:
+    BadRequest:
+      description: Malformed request (bad cursor or query parameter)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            invalid_cursor:
+              value:
+                error:
+                  code: invalid_cursor
+                  message: The provided cursor is not a valid message id
+    Unauthorized:
+      description: Missing or invalid session token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            unauthorized:
+              value:
+                error:
+                  code: unauthorized
+                  message: A valid session token is required
+    MissingPermission:
+      description: Caller lacks an effective permission required for this action
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            missing_permission:
+              value:
+                error:
+                  code: missing_permission
+                  message: You do not have permission to perform this action in this channel
+    NotFound:
+      description: Channel or message not found (unknown channel, or non-text channel)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            channel_not_found:
+              value:
+                error:
+                  code: channel_not_found
+                  message: Channel not found
+    UnprocessableEntity:
+      description: Semantic validation failed (e.g. content length out of range)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            content_too_long:
+              value:
+                error:
+                  code: validation_error
+                  message: Message content must be between 1 and 4000 characters
+    RateLimited:
+      description: Per-user send rate limit exhausted (per-pod token bucket)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            rate_limited:
+              value:
+                error:
+                  code: rate_limited
+                  message: You are sending messages too quickly, please slow down
+    InternalError:
+      description: Unexpected server error (no internal details exposed)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            internal_error:
+              value:
+                error:
+                  code: internal_error
+                  message: An unexpected error occurred
+    AccessServiceUnavailable:
+      description: >
+        Authorization could not be completed because community_service is
+        unreachable or timed out; the service fails closed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            access_unavailable:
+              value:
+                error:
+                  code: access_unavailable
+                  message: Message service is temporarily unavailable, please retry

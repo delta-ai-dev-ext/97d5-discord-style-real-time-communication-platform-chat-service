@@ -1,0 +1,191 @@
+schema_version: 2
+diagram_id: chat-service
+mode: service
+orientation: LR
+scope: chat_service service view — text message persistence, cursor history, synchronous
+  access checks and Kafka eventing.
+sources:
+- path: docs/architecture.md
+  sha256: c030c120ab305a02c6b37d4951c01a2ec0c755310c89329dc69136627cf52971
+- path: docs/openapi_spec.yaml
+  sha256: 52d4e0aa15b3548034a0c9ef835547cbaefa8221c7536cc28b83e8f59f784c5b
+- path: docs/user_stories.md
+  sha256: 97c4779c26e2bb1c28c78543be8393cc206a819c3ffdea5be26500abd7cd51af
+- path: docs/decisions/ADR-001-transactional-outbox-for-chat-events.md
+  sha256: 01a6aba569e18cb6ee65f638d61a6b6614cbd4b10f5b0fa87d4cf1f3c579261a
+- path: docs/decisions/ADR-002-fail-closed-access-checks.md
+  sha256: 0b363e220557c0f8c3a2bda1039354220a655274042a148efd30bbab66b60903
+- path: docs/decisions/ADR-003-time-ordered-message-ids-as-cursors.md
+  sha256: 824783a9e9789d552d5575ac8f4c6459303dfed22f290c1cc50b8f1cff2e7f97
+entities:
+- id: client
+  label: Member clients
+  kind: annotation
+  role: inbound
+  row: 400
+  evidence:
+  - path: docs/architecture.md
+    quote: 'Client → chat_service:'
+- id: svc
+  name: chat_service
+  label: chat_service
+  kind: service
+  technology: kubernetes-pod
+  role: service
+  row: 400
+  evidence:
+  - path: docs/architecture.md
+    quote: '`chat_service` is the persistent store and source of truth for **text
+      channel messages**.'
+- id: db
+  label: Chat PostgreSQL
+  kind: database
+  technology: postgresql
+  role: outbound
+  row: 330
+  evidence:
+  - path: docs/architecture.md
+    quote: Logical database owned exclusively by `chat_service`.
+- id: kafka
+  name: Kafka
+  label: Chat events (Kafka)
+  kind: broker
+  technology: kafka
+  role: outbound
+  row: 20
+  evidence:
+  - path: docs/architecture.md
+    quote: 'Pods hold **no** state: all durable data lives in PostgreSQL, all fan-out
+      in Kafka.'
+- id: community
+  label: community_service
+  kind: annotation
+  role: sync-only
+  row: 605
+  evidence:
+  - path: docs/architecture.md
+    quote: The check happens on **every** send and **every** history read
+relationships:
+- id: r-client
+  source: client
+  target: svc
+  type: request
+  interaction:
+    channel: direct
+    purpose: HTTP message API calls
+    protocol: HTTP
+  evidence:
+  - path: docs/architecture.md
+    quote: '| HTTP API layer | Request validation, JWT verification, error mapping,
+      rate limiting |'
+- id: r-access
+  source: svc
+  target: community
+  type: request
+  interaction:
+    channel: direct
+    purpose: per-request channel access decision
+    protocol: HTTP
+  evidence:
+  - path: docs/decisions/ADR-002-fail-closed-access-checks.md
+    quote: 'On every send and every history read, call `GET /internal/v1/channels/{channel_id}/access/{user_id}`
+      with:'
+  - path: docs/architecture.md
+    quote: W3C `traceparent` accepted on inbound HTTP, propagated to the `community_service`
+      call and stored in outbox payloads (`trace_parent` field) so downstream consumers
+      (gateway) can continue traces.
+- id: r-db
+  source: svc
+  target: db
+  type: ownership
+  evidence:
+  - path: docs/architecture.md
+    quote: '| Message repository | SQL persistence against the `messages` table |'
+- id: r-prod
+  source: svc
+  target: kafka
+  type: event
+  direction: forward
+  interaction:
+    channel: messaging
+    purpose: message lifecycle fan-out
+    protocol: Kafka
+  messaging:
+    role: producer
+    topic: chat_message_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '| Outbox relay | Publishes committed outbox rows to the `chat_message_events`
+      topic with backoff |'
+  - path: docs/architecture.md
+    quote: '| Kafka produce failure | Outbox row remains unpublished; relay retries
+      with backoff. Requests are never blocked on Kafka. |'
+- id: r-cons
+  source: kafka
+  target: svc
+  type: event
+  direction: forward
+  interaction:
+    channel: messaging
+    purpose: idempotent history purge
+    protocol: Kafka
+  messaging:
+    role: consumer
+    topic: community_events
+  evidence:
+  - path: docs/architecture.md
+    quote: '| Community-events consumer | Consumes `community_events`, performs idempotent
+      history purges |'
+  - path: docs/architecture.md
+    quote: '**Scaling**: replicas scale independently; the access check is per-request,
+      the outbox relay competes on unpublished rows, and the Kafka consumer group
+      rebalances automatically.'
+view:
+  entities:
+  - client
+  - svc
+  - db
+  - kafka
+  - community
+  groups: []
+  edges:
+  - id: e-client
+    source: client
+    target: svc
+    relationships:
+    - r-client
+    label: HTTP
+    flow: forward
+  - id: e-db
+    source: svc
+    target: db
+    relationships:
+    - r-db
+    label: SQL
+    flow: forward
+  - id: e-access
+    source: svc
+    target: community
+    relationships:
+    - r-access
+    label: HTTP access check
+    flow: forward
+  - id: e-prod
+    source: svc
+    target: kafka
+    relationships:
+    - r-prod
+    label: 'Producers
+
+      chat_service:chat_message_events'
+    flow: forward
+  - id: e-cons
+    source: kafka
+    target: svc
+    relationships:
+    - r-cons
+    label: 'Consumers
+
+      chat_service:community_events'
+    flow: feedback
+  omitted: []

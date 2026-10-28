@@ -1,1 +1,158 @@
-# 97d5-discord-style-real-time-communication-platform-chat-service
+# chat_service
+
+Persistent store and source of truth for **text channel messages** on the
+Discord-style real-time communication platform. It serves cursor-paginated
+history, provides idempotent sends, restricts edits/deletes to the author,
+authorizes every send and every history read against `community_service`, and
+publishes `message_created` / `message_edited` / `message_deleted` events
+through a transactional outbox.
+
+Runtime: **Bun** + TypeScript. The specification set that governs this service
+(architecture, OpenAPI contract, user stories, engineering guide and ADR-001..003)
+lives in the `docs` directory of this repository and is authoritative over this
+README.
+
+## HTTP API
+
+| Method and path | Behavior |
+|---|---|
+| `GET /v1/channels/{channel_id}/messages?before=&after=&limit=` | Newest-first history; `before` pages backwards, `after` backfills strictly newer messages oldest-first; `limit` 1..100 (default 50); `next_cursor` is `null` at the end of the range. Requires `can_view` **and** `can_read_history`. |
+| `POST /v1/channels/{channel_id}/messages` | `201` new message, `200` nonce replay (original row returned, nothing duplicated). Requires a text channel, membership, no ban, no active timeout and `can_send`. `429` when the per-user bucket is empty. |
+| `PATCH /v1/channels/{channel_id}/messages/{message_id}` | Author only; sets `edited_at`; no `community_service` call. |
+| `DELETE /v1/channels/{channel_id}/messages/{message_id}` | Author only; soft delete (`deleted_at`); repeat delete is `404`; success is `204`. |
+| `GET /healthz` | Liveness only - never probes Kafka or `community_service`. |
+| `GET /readyz` | `200` only when the PostgreSQL pool answers and the Kafka producer is connected; `503` while draining. |
+| `GET /metrics` | Prometheus exposition. |
+
+Errors always use the envelope `{"error": {"code", "message", "details?"}}` with the
+stable codes from the OpenAPI contract: `validation_error`, `invalid_cursor`,
+`unauthorized`, `missing_permission`, `member_timed_out`, `not_message_author`,
+`channel_not_found`, `message_not_found`, `rate_limited`, `access_unavailable`,
+`internal_error`.
+
+## Key behaviors
+
+- **Fail-closed authorization (ADR-002).** Every send and every history read calls
+  `GET {COMMUNITY_SERVICE_URL}/internal/v1/channels/{channel_id}/access/{user_id}`
+  with the service token and the inbound `traceparent`, a configurable timeout
+  (default 300 ms) and exactly one retry. The response is validated as untrusted
+  input before use; if no decision can be obtained the request fails with
+  `503 access_unavailable`. Decisions are never cached.
+- **Idempotent sends (US-002).** `(channel_id, author_user_id, client_nonce)` is
+  unique, so a retry conflicts and returns the original message with `200`. A
+  replay with different content still returns the original row.
+- **Transactional outbox (ADR-001).** Message and outbox row commit in one
+  transaction; the relay publishes committed rows to `chat_message_events`
+  (key `channel_id`) in `created_at` order, retries with capped exponential
+  backoff, and marks rows published only after the broker acknowledges. Requests
+  never wait on Kafka.
+- **Time-ordered ids (ADR-003).** 26-character Crockford base32 ids
+  (48-bit millisecond timestamp plus 80 random bits, monotonic per process) double
+  as pagination cursors.
+- **Purges.** `community_events` (group `chat_service`) handles
+  `channel_deleted` (only `type=text`) and `community_deleted` with bounded
+  batch deletes; `processed_events` deduplicates by `event_id`, and offsets are
+  committed only after the dedupe record is persisted.
+
+## Configuration
+
+All configuration comes from the environment and is validated at startup with
+`zod`; a missing or invalid variable fails fast with a structured, secret-free
+log line. See `.env.example`.
+
+| Variable | Required | Default |
+|---|---|---|
+| `PORT` | no | `3000` |
+| `DATABASE_URL` | yes | - |
+| `KAFKA_BROKERS` | yes | - |
+| `KAFKA_CLIENT_ID` | no | `chat_service` |
+| `KAFKA_SASL_MECHANISM` / `KAFKA_SASL_USERNAME` / `KAFKA_SASL_PASSWORD` / `KAFKA_TLS` | no | - |
+| `CHAT_KAFKA_CONSUMER_GROUP` | no | `chat_service` |
+| `COMMUNITY_SERVICE_URL` | yes | - |
+| `SERVICE_TOKEN` | yes | - |
+| `CLERK_JWKS_URL` or `CLERK_JWT_KEY` | yes (one of) | - |
+| `CLERK_ISSUER` / `CLERK_AUDIENCE` | yes | - |
+| `ACCESS_CHECK_TIMEOUT_MS` | no | `300` |
+| `RATE_LIMIT_SEND_PER_MINUTE` | no | `30` |
+| `SHUTDOWN_TIMEOUT_SECONDS` | no | `25` |
+| `LOG_LEVEL` | no | `info` |
+
+Clerk session tokens are verified **offline**: `CLERK_JWT_KEY` (PEM) is used
+directly, otherwise the key set at `CLERK_JWKS_URL` is fetched once and cached
+(5 min TTL, refreshed on rotation). The request path never calls the Clerk
+Backend API.
+
+## Development
+
+```bash
+bun install        # dependencies (lockfile is committed)
+make dev           # bun --watch src/index.ts
+make test          # bun test --coverage (thresholds: 80% line/branch/function/statement)
+make typecheck     # tsc --noEmit
+make lint          # eslint src/ tests/
+make run           # bun run src/index.ts
+make migrate       # drizzle-kit push (applies src/db/schema.ts)
+make build         # docker build -t chat_service:latest .
+```
+
+Database schema lives in `src/db/schema.ts`: `messages`, `outbox_events` and
+`processed_events`, plus the nonce unique index, the partial
+`(channel_id, id DESC) WHERE deleted_at IS NULL` cursor index and the
+`community_id` index.
+
+## Project layout
+
+```
+src/
+  index.ts            app factory, bootstrap, graceful shutdown
+  config.ts           zod-validated environment
+  logger.ts           structured JSON logs (winston)
+  metrics.ts          prom-client registry and helpers
+  trace.ts            W3C traceparent handling
+  errors.ts           AppError and the public error envelope
+  rateLimit.ts        per-user token bucket
+  health.ts           liveness/readiness state
+  routes/             Elysia routers (messages, health)
+  controllers/        thin request handling and response mapping
+  services/           message domain rules
+  repositories/       repository contracts and drizzle implementations
+  access/             community_service client and decision mapping
+  auth/               offline Clerk verification and JWKS handling
+  events/             envelopes, outbox relay, community_events consumer
+  models/             ids, message DTOs and validation, pagination
+  db/                 drizzle schema and pool
+tests/{unit,integration,mocks}/
+```
+
+## Testing conventions
+
+- `bun:test` only; no shared mutable state, no sleeps, no skips.
+- Unit tests in `tests/unit/` cover domain rules (nonce idempotency, author-only
+  mutations, cursor edges, fail-closed paths, outbox retry and backoff, consumer
+  dedupe, offline Clerk verification with real RS256 fixtures).
+- Integration tests in `tests/integration/` drive the in-process app through
+  `app.handle(new Request(...))` with every external dependency faked from
+  `tests/mocks/`: in-memory repositories reproducing the nonce constraint, Kafka
+  producer/consumer doubles, `community_service` fetch stubs and a token
+  verifier stub.
+- `src/index.ts`, `src/db/client.ts`, the drizzle repositories and the kafkajs
+  adapters are excluded from the coverage gate because they need a live
+  PostgreSQL or Kafka broker; the behavior they wire is covered through the same
+  interfaces they implement.
+
+## Operations
+
+- Stateless: any replica serves any request; all durable state is in PostgreSQL.
+- `SIGTERM`/`SIGINT`: `/readyz` flips to `503`, in-flight requests are drained,
+  the consumer stops with consistent committed offsets, pending outbox rows are
+  flushed best-effort inside `SHUTDOWN_TIMEOUT_SECONDS`, then the producer and
+  pool close and the process exits `0`.
+- Metrics: `chat_messages_sent_total{channel_type}`,
+  `chat_messages_edited_total`, `chat_messages_deleted_total`,
+  `chat_send_rejections_total{reason}`, `chat_send_retries_deduplicated_total`,
+  `http_request_duration_seconds{route,method,status_class}`,
+  `chat_access_check_duration_seconds`, `kafka_produce_errors_total{topic}`,
+  `kafka_consumer_lag{topic,group}`, `outbox_unpublished_age_seconds`.
+- Logs are structured JSON with `timestamp`, `level`, `service_name`,
+  `request_id`, `trace_id`, `operation` and `status`; message content is never
+  logged.
