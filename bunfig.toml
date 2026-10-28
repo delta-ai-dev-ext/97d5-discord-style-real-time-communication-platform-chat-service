@@ -1,0 +1,21 @@
+[test]
+coverage = true
+coverageThreshold = { line = 80, branch = 80, function = 80, statement = 80 }
+coverageSkipTestFiles = true
+# Bootstrap and live-infrastructure adapters cannot be exercised without a real
+# PostgreSQL server and Kafka broker (none exist in the agent/CI test runtime).
+# The behaviour they wire together is covered through the injected interfaces
+# they depend on, which are faked in tests/mocks/.
+coveragePathIgnorePatterns = [
+  "src/index.ts",
+  "tests/**",
+  "src/db/client.ts",
+  "src/repositories/drizzleMessages.ts",
+  "src/repositories/drizzleOutbox.ts",
+  "src/repositories/drizzlePurge.ts",
+  "src/events/kafkaProducer.ts",
+  "src/events/kafkaConsumer.ts",
+]
+
+[bundle]
+entrypoints = ["src/index.ts"]
