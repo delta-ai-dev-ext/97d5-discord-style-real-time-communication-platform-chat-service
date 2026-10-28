@@ -41,7 +41,7 @@ Makefile targets (all tooling runs via `make`):
 
 No S3-compatible storage client is required (no blobs in this service). No Resend/LiveKit SDKs here — those belong to other services.
 
-## Kubernetes Lifecycle & Probes
+## Container Lifecycle & Probes
 
 - **Statelessness**: no session state, caches of authority, or files on disk. Any replica serves any request; safe with `replicas > 1`.
 - **`SIGTERM` / `SIGINT` graceful shutdown**:
@@ -88,7 +88,7 @@ tests/{unit,integration,mocks}/
 
 ## Configuration & Secrets Management
 
-12-factor: all configuration from environment variables, validated at startup by a zod schema; fail fast with a structured error log if a required var is missing. Never `.env` in production (local only, gitignored); production secrets come from Kubernetes secrets mounted as env vars.
+12-factor: all configuration from environment variables, validated at startup by a zod schema; fail fast with a structured error log if a required var is missing. Never `.env` in production (local only, gitignored); production secrets come from environment variables injected from your platform secret store.
 
 | Variable | Required | Purpose |
 |---|---|---|

@@ -30,7 +30,7 @@ entities:
   name: chat_service
   label: chat_service
   kind: service
-  technology: kubernetes-pod
+  technology: container
   role: service
   row: 400
   evidence:

@@ -13,7 +13,7 @@ Every persisted message must reach `realtime_gateway` for live fan-out. Two writ
 - Kafka producer retry semantics vs. database rollback → events for messages that never existed.
 - "Retry failed message" UX requires that the send response, the stored message, and the emitted event can never disagree.
 
-`chat_service` is a stateless pod; it cannot keep in-memory pending queues to bridge the gap.
+`chat_service` is a stateless replica; it cannot keep in-memory pending queues to bridge the gap.
 
 ## Decision
 Persist the Kafka event in an `outbox_events` table **in the same database transaction** as the message write. A separate, asynchronous outbox relay polls unpublished rows and publishes them to `chat_message_events` (partition key `channel_id`) with retry/backoff, marking rows `published_at` only after successful acknowledgment.

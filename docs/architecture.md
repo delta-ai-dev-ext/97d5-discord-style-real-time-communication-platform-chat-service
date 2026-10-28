@@ -193,11 +193,11 @@ No cross-service table sharing; `community_id`/`channel_id`/`user_id` are opaque
 
 ---
 
-## 5. Stateless Kubernetes Operational Model
+## Stateless Container Operational Model
 
 - Pods hold **no** state: all durable data lives in PostgreSQL, all fan-out in Kafka. Any replica can serve any request (`replicas >= 1`).
 - **Graceful shutdown on `SIGTERM`/`SIGINT`**:
-  1. `/readyz` starts failing (503) so Kubernetes stops routing traffic.
+  1. `/readyz` starts failing (503) so your orchestrator stops routing traffic.
   2. Stop accepting new HTTP requests; let in-flight requests finish within a bounded drain window (~15–30 s).
   3. Pause the `community_events` consumer loop and commit offsets of completed work.
   4. Flush pending outbox rows (best effort within the window), close the Kafka producer and the PostgreSQL pool, exit `0`.
